@@ -47,8 +47,8 @@
 
 ## 下载与使用
 
-1. 到 [Releases](https://github.com/xyf2790/chuansheng/releases) 下载 `传声-便携版.exe`（单文件，约 25 MB，内含 scrcpy 与 adb）
-2. 双击运行 → **首次会解压约 25 MB** 到 `%LOCALAPPDATA%\PhoneAudioTray\`（5~15 秒）
+1. 到 [Releases](https://github.com/xyf2790/chuansheng/releases) 下载 `Transmit-v1.0.0.exe`（便携版单文件，约 25 MB，内含 scrcpy 与 adb）
+2. 双击运行（文件名可随意改）→ **首次会解压约 25 MB** 到 `%LOCALAPPDATA%\PhoneAudioTray\`（5~15 秒）
 3. 托盘出现图标，**双击**打开连接窗口 → 选设备 → 连接
 4. 右键托盘菜单可开画面、调音量、传文件、看进程
 
