@@ -130,9 +130,7 @@ namespace PhoneAudioTray
             {
                 if (!created)
                 {
-                    MessageBox.Show("传声托盘已经在运行了（看任务栏右下角的小图标）。", "传声",
-                        MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    return;
+                    return;   // 已经有实例在跑：静默退出（弹模态框会卡住命令行/脚本调用）
                 }
 
                 Application.EnableVisualStyles();
@@ -218,6 +216,7 @@ namespace PhoneAudioTray
             connect.DropDownItems.Add("USB 连接（直接连）", null, (s, e) => ConnectUsb());
             connect.DropDownItems.Add("选择设备…", null, (s, e) => ShowConnectDialog(false));
             connect.DropDownItems.Add("WiFi 连接…", null, (s, e) => ShowConnectDialog(true));
+            connect.DropDownItems.Add("配对新设备…（首次连某台手机用）", null, (s, e) => ShowPairDialog());
             menu.Items.Add(connect);
 
             var volume = new ToolStripMenuItem("音量");
@@ -868,6 +867,7 @@ namespace PhoneAudioTray
                 "  --connect-usb               连接 USB 设备（第一个）",
                 "  --connect-wifi <ip:端口>    直连指定地址",
                 "  --connect                   打开选设备窗口",
+                "  --pair <ip:端口> <6位码>     首次连某台手机时配对",
                 "  --devices                   列出设备与可发现的 WiFi 设备",
                 "",
                 "开关（on / off / 省略=切换）",
@@ -937,6 +937,80 @@ namespace PhoneAudioTray
             StartSession(usb[0], "USB");
         }
 
+        /// <summary>从 mdns 里找正在等待配对的设备（手机开着「使用配对码配对设备」时才有）</summary>
+        public static List<string> DiscoverPairing()
+        {
+            var list = new List<string>();
+            var output = RunAdb("mdns services");
+            foreach (var line in output.Split('\n'))
+            {
+                if (line.IndexOf("_adb-tls-pairing", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                var m = Regex.Match(line, @"(\d{1,3}(?:\.\d{1,3}){3}:\d+)");
+                if (m.Success && !list.Contains(m.Groups[1].Value)) list.Add(m.Groups[1].Value);
+            }
+            return list;
+        }
+
+        /// <summary>配对一台新手机：adb pair → 再自动找连接端口并连上</summary>
+        public static void ShowPairDialog()
+        {
+            var suggested = "";
+            var found = DiscoverPairing();
+            if (found.Count > 0) suggested = found[0];
+
+            using (var dlg = new PairDialog(suggested))
+            {
+                if (dlg.ShowDialog() != DialogResult.OK) return;
+
+                var addr = dlg.Addr;
+                var code = dlg.Code;
+
+                Cursor.Current = Cursors.WaitCursor;
+                string result;
+                try { result = RunAdb("pair " + addr + " " + code, 30000); }
+                finally { Cursor.Current = Cursors.Default; }
+
+                if (result.IndexOf("Successfully paired", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    MessageBox.Show("配对失败：\r\n\r\n" + result.Trim()
+                        + "\r\n\r\n检查三点：\r\n"
+                        + "  1) 填的是「IP:配对端口」，不是下面的连接端口\r\n"
+                        + "  2) 配对码是 6 位数字\r\n"
+                        + "  3) 手机和电脑在同一个 WiFi",
+                        "配对新设备", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                Toast.Show("配对成功", "正在查找可连接的地址…");
+
+                var ip = addr.Contains(":") ? addr.Substring(0, addr.IndexOf(':')) : addr;
+                string target = null;
+                for (int i = 0; i < 12 && target == null; i++)
+                {
+                    target = DiscoverWifi().FirstOrDefault(a => a.StartsWith(ip + ":"));
+                    if (target == null) Thread.Sleep(500);
+                }
+
+                if (target == null)
+                {
+                    MessageBox.Show("配对成功 ✅\r\n\r\n但这会儿还没扫描到可连接的地址。\r\n"
+                        + "请让手机停在「无线调试」页面，然后点「WiFi 连接…」→ 刷新，选 " + ip + " 开头那一项。",
+                        "配对新设备", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                string detail;
+                if (TryConnect(target, out detail))
+                {
+                    StartSession(target, "WiFi");
+                }
+                else
+                {
+                    MessageBox.Show("已配对，但连接 " + target + " 失败：\r\n\r\n" + detail.Trim(),
+                        "配对新设备", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+        }
         public static void ShowConnectDialog(bool preferWifi)
         {
             using (var dlg = new ConnectDialog(preferWifi))
@@ -977,7 +1051,9 @@ namespace PhoneAudioTray
                               + "  · 手机断开了 WiFi，或关掉了「无线调试」\r\n\r\n"
                             : "")
                         + "刚重新扫描到：" + (fresh.Count == 0 ? "（没有设备）" : string.Join("，", fresh))
-                        + "\r\n\r\n建议：手机确认 WiFi 连着 + 无线调试是开着的，然后重新打开这个窗口刷新列表。";
+                        + "\r\n\r\n建议：\r\n"
+                        + "  · 手机确认 WiFi 连着 + 无线调试是开着的，然后重新打开这个窗口刷新列表\r\n"
+                        + "  · 如果这是【第一次】连这台手机，要先配对：连接手机 → 配对新设备…";
 
                 MessageBox.Show(msg, "WiFi 连接", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }

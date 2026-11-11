@@ -44,7 +44,10 @@ namespace PhoneAudioTray
                             catch (Exception ex) { result = "ERR " + ex.Message; }
 
                             using (var writer = new StreamWriter(server, new UTF8Encoding(false), 1024, true) { AutoFlush = true })
+                            {
                                 writer.WriteLine(result ?? "OK");
+                                writer.Flush();
+                            }
                         }
                     }
                     catch { Thread.Sleep(500); }
@@ -64,8 +67,9 @@ namespace PhoneAudioTray
                     client.Connect(timeoutMs);
                     using (var writer = new StreamWriter(client, new UTF8Encoding(false), 1024, true) { AutoFlush = true })
                         writer.WriteLine(command);
+                    // 服务端可能返回多行（比如 --help），必须读到 EOF 再返回
                     using (var reader = new StreamReader(client, Encoding.UTF8, false, 1024, true))
-                        return reader.ReadLine() ?? "OK";
+                        return (reader.ReadToEnd() ?? "").TrimEnd('\r', '\n');
                 }
             }
             catch (Exception ex)
@@ -76,15 +80,9 @@ namespace PhoneAudioTray
 
         public static bool IsRunning()
         {
-            try
-            {
-                using (var client = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut))
-                {
-                    client.Connect(300);
-                    return true;
-                }
-            }
-            catch { return false; }
+            // 用 ping 探活：直接连上就断开会把服务端的单实例管道搅乱
+            var r = Send("ping", 1500);
+            return !string.IsNullOrEmpty(r) && !r.StartsWith("ERR");
         }
     }
 
@@ -193,16 +191,8 @@ namespace PhoneAudioTray
                     return true;
                 }
 
-                var exe = Application.ExecutablePath;
-                try { Process.Start(new ProcessStartInfo(exe) { UseShellExecute = false }); } catch { }
-
-                for (int i = 0; i < 40 && !Ipc.IsRunning(); i++) Thread.Sleep(250);
-                if (!Ipc.IsRunning())
-                {
-                    Out("ERR 启动失败");
-                    return true;
-                }
-                Thread.Sleep(500);   // 等它把菜单搭好
+                Out("ERR 传声没在运行。请先双击「传声.exe」启动（托盘出现图标后），再执行命令。");
+                return true;
             }
 
             var result = Ipc.Send(line);
@@ -240,6 +230,13 @@ namespace PhoneAudioTray
                 case "connect-usb":
                 case "usb":
                     return "connect-usb";
+
+                case "pair":
+                    {
+                        var a1 = Arg(a, 1);
+                        var a2 = Arg(a, 2);
+                        return a1 == null || a2 == null ? "ERR-pair" : "pair " + a1 + " " + a2;
+                    }
 
                 case "connect-wifi":
                 case "connect":
@@ -343,6 +340,9 @@ namespace PhoneAudioTray
             {
                 switch (cmd)
                 {
+                    case "ping":
+                        return "OK";
+
                     case "status":
                         return Program.StatusText();
 
@@ -352,6 +352,29 @@ namespace PhoneAudioTray
                             if (usb.Count == 0) return "ERR 没有 USB 设备（检查数据线和「允许 USB 调试」）";
                             Program.StartSession(usb[0], "USB");
                             return "OK 已连接 " + usb[0];
+                        }
+
+                    case "pair":
+                        {
+                            if (string.IsNullOrEmpty(arg)) return "ERR 用法：--pair <ip:配对端口> <6位配对码>";
+                            var pieces = arg.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                            if (pieces.Length < 2) return "ERR 用法：--pair <ip:配对端口> <6位配对码>";
+
+                            var res = Program.RunAdb("pair " + pieces[0] + " " + pieces[1], 30000);
+                            if (res.IndexOf("Successfully paired", StringComparison.OrdinalIgnoreCase) < 0)
+                                return "ERR 配对失败：" + res.Trim();
+
+                            var ip = pieces[0].Contains(":") ? pieces[0].Substring(0, pieces[0].IndexOf(':')) : pieces[0];
+                            string target = null;
+                            for (int i = 0; i < 12 && target == null; i++)
+                            {
+                                target = Program.DiscoverWifi().FirstOrDefault(x => x.StartsWith(ip + ":"));
+                                if (target == null) System.Threading.Thread.Sleep(500);
+                            }
+                            if (target == null) return "OK 配对成功，但暂时没发现连接地址，请在手机上保持无线调试页面再试 WiFi 连接";
+                            string detail;
+                            if (Program.TryConnect(target, out detail)) { Program.StartSession(target, "WiFi"); return "OK 配对并已连接 " + target; }
+                            return "OK 已配对，但连接失败：" + detail.Trim();
                         }
 
                     case "connect-wifi":

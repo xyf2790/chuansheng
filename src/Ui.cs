@@ -297,6 +297,73 @@ namespace PhoneAudioTray
         }
     }
 
+    // ---------- 配对对话框（Android 11+ 无线调试首次连接需要）----------
+    internal sealed class PairDialog : Form
+    {
+        private TextBox txtAddr;
+        private TextBox txtCode;
+        public string Addr { get; private set; }
+        public string Code { get; private set; }
+
+        public PairDialog(string suggestedAddr)
+        {
+            Text = "配对新设备";
+            Size = new Size(520, 300);
+            StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            Font = new Font("Microsoft YaHei UI", 9f);
+
+            var tip = new Label
+            {
+                Left = 16, Top = 12, Width = 470, Height = 76,
+                Text = "手机上传第一次连这台电脑，需要先配对：\r\n"
+                     + "手机：开发者选项 → 无线调试 → 「使用配对码配对设备」\r\n"
+                     + "把弹窗里的「IP 地址和端口」「配对码」填到下面。"
+            };
+            Controls.Add(tip);
+
+            var l1 = new Label { Left = 16, Top = 96, Width = 110, Text = "IP:配对端口" };
+            Controls.Add(l1);
+            txtAddr = new TextBox { Left = 132, Top = 93, Width = 350, Text = suggestedAddr ?? "" };
+            Controls.Add(txtAddr);
+
+            var l2 = new Label { Left = 16, Top = 132, Width = 110, Text = "6 位配对码" };
+            Controls.Add(l2);
+            txtCode = new TextBox { Left = 132, Top = 129, Width = 160 };
+            Controls.Add(txtCode);
+
+            var hint = new Label
+            {
+                Left = 16, Top = 166, Width = 470, Height = 34,
+                ForeColor = Color.DimGray,
+                Text = "配对端口和下面的连接端口不是同一个；配对成功后程序会自动去找连接端口。"
+            };
+            Controls.Add(hint);
+
+            var ok = new Button { Left = 300, Top = 212, Width = 88, Height = 32, Text = "配对" };
+            var cancel = new Button { Left = 396, Top = 212, Width = 88, Height = 32, Text = "取消", DialogResult = DialogResult.Cancel };
+            Controls.Add(ok);
+            Controls.Add(cancel);
+            CancelButton = cancel;
+
+            ok.Click += (s, e) =>
+            {
+                var a = (txtAddr.Text ?? "").Trim();
+                var c = (txtCode.Text ?? "").Trim();
+                if (!a.Contains(":") || c.Length == 0)
+                {
+                    MessageBox.Show("请把「IP:端口」和「6 位配对码」都填上。", "配对",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                Addr = a;
+                Code = c;
+                DialogResult = DialogResult.OK;
+            };
+        }
+    }
     // ---------- 调试窗口：scrcpy 日志 + 可执行 adb 命令 ----------
     internal sealed class DebugForm : Form
     {
