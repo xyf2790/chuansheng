@@ -30,3 +30,4 @@ selftest.log
 build/
 *.o
 *.obj
+desktop.ini
