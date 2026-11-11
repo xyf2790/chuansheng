@@ -78,6 +78,24 @@ build.cmd            :: 编译开发版 传声.exe（运行时去 D:\Apply\Scrcp
 build.cmd portable   :: 打包单文件版（需要把 scrcpy 运行时放在同目录或设置 SCRCPY_DIR）
 ```
 
+## 推送不上去怎么办
+
+国内直连 GitHub 经常出现「ping 通、但 443 握手超时」，`git push` 报：
+
+```
+Failed to connect to github.com:443 after 21000 ms
+```
+
+而浏览器能打开 GitHub。原因是 DNS 解析到的那个 IP 被干扰，**换一个 IP 就能通**。
+
+本仓库带了一个小工具 `tools/ghpush.exe`（源码 `tools/GhPush.cs`）：自己起一个本地转发，把 github.com:443 指向实测可用的 IP，再执行推送，失败会依次换下一个 IP。
+
+```cmd
+push.cmd          :: 一键：自动换 IP 推送
+```
+
+> 附：可用 IP 会变，当前候选写在 `tools/GhPush.cs` 顶部的 `Candidates` 数组里，随时可加。
+
 ## 目录结构
 
 ```

@@ -32,5 +32,5 @@ build/
 *.obj
 desktop.ini
 
-tools/
 
+tools/*.exe
