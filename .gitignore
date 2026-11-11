@@ -31,3 +31,6 @@ build/
 *.o
 *.obj
 desktop.ini
+
+tools/
+
