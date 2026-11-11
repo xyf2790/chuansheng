@@ -224,6 +224,9 @@ namespace PhoneAudioTray
                 case "i":                    // 兼容 --i 这种误写
                 case "ipc":
                     return Arg(a, 1);
+                case "version":
+                    return "version";
+
                 case "status":
                     return "status";
 
@@ -342,6 +345,9 @@ namespace PhoneAudioTray
                 {
                     case "ping":
                         return "OK";
+
+                    case "version":
+                        return "传声 v" + Program.AppVersion;
 
                     case "status":
                         return Program.StatusText();

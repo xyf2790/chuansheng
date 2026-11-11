@@ -33,4 +33,5 @@ build/
 desktop.ini
 
 
-tools/*.exe
+tools/
+push.cmd

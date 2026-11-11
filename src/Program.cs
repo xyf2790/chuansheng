@@ -26,6 +26,8 @@ namespace PhoneAudioTray
 
     internal static class Program
     {
+        public const string AppVersion = "1.1.0";
+
         public static string BaseDir = AppDomain.CurrentDomain.BaseDirectory;
         /// <summary>外部 scrcpy 目录（settings.txt 里的 scrcpyDir，或同级的 Scrcpy 文件夹）</summary>
         public static string ScrcpyDir = "";
@@ -861,7 +863,7 @@ namespace PhoneAudioTray
         {
             return string.Join(Environment.NewLine, new[]
             {
-                "传声 · 命令行用法",
+                "传声 v" + AppVersion + " · 命令行用法",
                 "",
                 "连接",
                 "  --connect-usb               连接 USB 设备（第一个）",

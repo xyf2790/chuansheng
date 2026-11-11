@@ -13,7 +13,7 @@ if not exist "%CSC%" (
 rem 选项必须写在源文件之前，否则 csc 报 CS2022
 set "OPTS=/nologo /target:winexe /codepage:65001 /optimize+ /win32icon:app.ico"
 set "OPTS=!OPTS! /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll"
-set "SRCS=src\Program.cs src\Ui.cs src\Welcome.cs src\JobObject.cs src\Payload.cs src\Transfer.cs"
+set "SRCS=src\Program.cs src\Ui.cs src\Welcome.cs src\Version.cs src\JobObject.cs src\Payload.cs src\Transfer.cs"
 set "SRCS=!SRCS! src\FileBrowser.cs src\ProcessTree.cs src\AppIcons.cs src\PinOverlay.cs"
 set "SRCS=!SRCS! src\Toast.cs src\Shortcut.cs src\Cli.cs"
 
