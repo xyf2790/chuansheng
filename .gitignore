@@ -35,3 +35,8 @@ desktop.ini
 
 tools/
 push.cmd
+
+# 本机测试数据与发布中间文件
+tests/samples/
+release/
+docs/superpowers/

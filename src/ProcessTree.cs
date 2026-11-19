@@ -1,9 +1,14 @@
-// ProcessTree.cs — 手机进程树（按父进程展开，可强停应用）
+﻿// ProcessTree.cs — 手机任务管理器（平铺进程与实时占用）
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace PhoneAudioTray
@@ -14,411 +19,322 @@ namespace PhoneAudioTray
         public int PPid;
         public string User;
         public string Name;
-        public long RssKb;
-
-        public bool IsApp { get { return User != null && User.StartsWith("u0_"); } }
-        public bool IsKernelThread { get { return Name != null && Name.StartsWith("["); } }
-
-        public string RssText
-        {
-            get
-            {
-                if (RssKb >= 1024 * 1024) return (RssKb / 1024.0 / 1024).ToString("0.00") + " GB";
-                if (RssKb >= 1024) return (RssKb / 1024.0).ToString("0.0") + " MB";
-                return RssKb + " KB";
-            }
-        }
+        public string Started;
+        public long RssKb = -1;
+        public double? Cpu;
+        public bool IsApp { get { return Regex.IsMatch(User ?? "", @"^u\d+_[ai]\d+$"); } }
+        public bool IsKernelThread { get { return (Name ?? "").StartsWith("["); } }
+        public string Package { get { return (Name ?? "").Split(':')[0]; } }
+        public string DisplayName { get { var n = AppIcons.DisplayName(Package); return string.IsNullOrEmpty(n) ? Package : n; } }
+        public bool CanStop { get { return Regex.IsMatch(User ?? "", @"^u\d+_a\d+$") && Regex.IsMatch(Package, @"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$"); } }
     }
 
     internal sealed class ProcessTreeDialog : Form
     {
         private readonly string serial;
-        private TreeView tree;
-        private TextBox txtFilter;
-        private CheckBox chkAppsOnly;
-        private Label lblStatus;
+        private readonly CancellationTokenSource closing = new CancellationTokenSource();
+        private readonly System.Windows.Forms.Timer refreshTimer = new System.Windows.Forms.Timer { Interval = 5000 };
+        private readonly ListView list;
+        private readonly TextBox filter;
+        private readonly CheckBox appsOnly;
+        private readonly CheckBox autoRefresh;
+        private readonly Button refresh;
+        private readonly Button stop;
+        private readonly Label status;
         private List<ProcInfo> allProcs = new List<ProcInfo>();
-        private ImageList iconList;
-        private readonly Dictionary<string, List<TreeNode>> nodesByPkg = new Dictionary<string, List<TreeNode>>();
-        private readonly Dictionary<string, int> iconIndexByPkg = new Dictionary<string, int>();
-
-        private static readonly Color ColorApp = Color.FromArgb(0, 102, 204);      // 应用进程：蓝
-        private static readonly Color ColorSystem = Color.FromArgb(150, 95, 0);    // 系统进程：棕
-        private static readonly Color ColorKernel = Color.Gray;                     // 内核线程：灰
-        private static readonly Color ColorGhost = Color.Silver;                    // 隐藏父进程：浅灰
-
-        private static Color ColorOf(ProcInfo p)
-        {
-            if (p.IsKernelThread) return ColorKernel;
-            if (p.IsApp) return ColorApp;
-            return ColorSystem;
-        }
+        private int sortColumn = 4;
+        private bool descending = true;
+        private bool busy;
+        private bool closed;
+        private string updated = "";
+        private string refreshError = "";
 
         public ProcessTreeDialog(string serial)
         {
             this.serial = serial;
-
-            Text = "手机进程树（" + serial + "）";
-            Size = new Size(820, 740);
+            Text = "手机任务管理器（" + serial + "）";
+            ClientSize = new Size(960, 650);
+            MinimumSize = new Size(840, 440);
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
-
-            var btnRefresh = new Button { Left = 12, Top = 12, Width = 78, Height = 28, Text = "刷新" };
-            btnRefresh.Click += (s, e) => LoadProcs();
-            Controls.Add(btnRefresh);
-
-            var lbl = new Label { Left = 100, Top = 17, Width = 60, Text = "筛选：" };
-            Controls.Add(lbl);
-
-            txtFilter = new TextBox { Left = 166, Top = 14, Width = 220 };
-            txtFilter.TextChanged += (s, e) => BuildTree();
-            Controls.Add(txtFilter);
-
-            chkAppsOnly = new CheckBox { Left = 400, Top = 16, Width = 190, Text = "只看应用进程（u0_*）", Checked = true };
-            chkAppsOnly.CheckedChanged += (s, e) => BuildTree();
-            Controls.Add(chkAppsOnly);
-
-            iconList = new ImageList { ImageSize = new Size(32, 32), ColorDepth = ColorDepth.Depth32Bit };
-            tree = new TreeView
-            {
-                Left = 12, Top = 48, Width = 780, Height = 570,
-                HideSelection = false, ShowLines = true, ShowPlusMinus = true,
-                ShowNodeToolTips = true,
-                ImageList = iconList,
-                ItemHeight = 36
+            refresh = new Button { Left = 12, Top = 12, Width = 76, Height = 28, Text = "刷新" };
+            Controls.Add(refresh);
+            Controls.Add(new Label { Left = 102, Top = 18, Width = 44, Text = "搜索" });
+            filter = new TextBox { Left = 146, Top = 15, Width = 280 };
+            Controls.Add(filter);
+            appsOnly = new CheckBox { Left = 444, Top = 16, Width = 124, Text = "只看应用进程", Checked = true };
+            autoRefresh = new CheckBox { Left = 590, Top = 16, Width = 160, Text = "每 5 秒自动刷新", Checked = true };
+            Controls.Add(appsOnly);
+            Controls.Add(autoRefresh);
+            list = new ListView {
+                Left = 12, Top = 52, Width = 936, Height = 494,
+                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+                View = View.Details, FullRowSelect = true, HideSelection = false, MultiSelect = false,
+                GridLines = true, ShowItemToolTips = true
             };
-            Controls.Add(tree);
-
-            lblStatus = new Label
-            {
-                Left = 12, Top = 626, Width = 520,
-                ForeColor = Color.DimGray,
-                Text = ""
+            list.Columns.Add("应用名称", 200);
+            list.Columns.Add("进程名 / 包名", 410);
+            list.Columns.Add("PID", 80, HorizontalAlignment.Right);
+            list.Columns.Add("CPU %", 100, HorizontalAlignment.Right);
+            list.Columns.Add("内存 MB ▼", 120, HorizontalAlignment.Right);
+            Controls.Add(list);
+            status = new Label { Left = 12, Top = 555, Width = 936, Height = 38,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right, ForeColor = Color.DimGray };
+            Controls.Add(status);
+            Controls.Add(new Label { Left = 12, Top = 604, Width = 680, Height = 32,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+                Text = "CPU：单核满载为 100%，多核可超过 100%；内存：RSS，含共享内存。" });
+            stop = new Button { Left = 718, Top = 604, Width = 120, Height = 30,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Right, Text = "强行停止应用", Enabled = false };
+            var close = new Button { Left = 850, Top = 604, Width = 98, Height = 30,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Right, Text = "关闭", DialogResult = DialogResult.Cancel };
+            Controls.Add(stop);
+            Controls.Add(close);
+            CancelButton = close;
+            refresh.Click += (s, e) => LoadProcs();
+            filter.TextChanged += (s, e) => BuildList();
+            appsOnly.CheckedChanged += (s, e) => BuildList();
+            autoRefresh.CheckedChanged += (s, e) => refreshTimer.Enabled = autoRefresh.Checked;
+            list.SelectedIndexChanged += (s, e) => UpdateStopButton();
+            list.ColumnClick += (s, e) => {
+                if (sortColumn == e.Column) descending = !descending;
+                else { sortColumn = e.Column; descending = e.Column >= 2; }
+                BuildList();
             };
-            Controls.Add(lblStatus);
-
-            // 颜色图例
-            int lx = 12;
-            foreach (var item in new[]
-            {
-                new object[] { "■ 应用进程", ColorApp },
-                new object[] { "■ 系统进程", ColorSystem },
-                new object[] { "■ 内核线程", ColorKernel },
-                new object[] { "■ 已隐藏父进程", ColorGhost }
-            })
-            {
-                var lab = new Label
-                {
-                    Left = lx,
-                    Top = 650,
-                    Width = 118,
-                    Text = (string)item[0],
-                    ForeColor = (Color)item[1]
-                };
-                Controls.Add(lab);
-                lx += 118;
-            }
-
-            var btnKill = new Button { Left = 540, Top = 644, Width = 120, Height = 32, Text = "结束进程" };
-            btnKill.Click += (s, e) => KillSelected();
-            Controls.Add(btnKill);
-
-            var btnClose = new Button { Left = 694, Top = 644, Width = 98, Height = 32, Text = "关闭", DialogResult = DialogResult.Cancel };
-            Controls.Add(btnClose);
-            CancelButton = btnClose;
-
-            Shown += (s, e) => LoadProcs();
+            stop.Click += (s, e) => StopSelected();
+            refreshTimer.Tick += (s, e) => LoadProcs();
+            Shown += (s, e) => { refreshTimer.Start(); LoadProcs(); };
         }
 
-        private void LoadProcs()
+        protected override void Dispose(bool disposing)
         {
-            Cursor.Current = Cursors.WaitCursor;
-            try
-            {
-                // 优先 Android 8+ 的 toybox ps；老机型退回默认 ps 输出
-                var procs = ParsePs(Program.RunAdb("-s " + serial + " shell ps -A -o PID,PPID,USER,NAME,RSS", 30000), true);
+            if (disposing && !closed) {
+                closed = true;
+                closing.Cancel();
+                refreshTimer.Dispose();
+            }
+            base.Dispose(disposing);
+        }
 
-                if (procs.Count == 0)
-                    procs = ParsePs(Program.RunAdb("-s " + serial + " shell ps -A", 30000), false);
+        private void SetBusy(bool value)
+        {
+            busy = value;
+            refresh.Enabled = !value;
+            refresh.Text = value ? "读取中…" : "刷新";
+            UpdateStopButton();
+        }
 
-                if (procs.Count == 0)
-                    procs = ParsePs(Program.RunAdb("-s " + serial + " shell ps", 30000), false);
+        private ProcInfo Selected()
+        {
+            return list.SelectedItems.Count == 0 ? null : list.SelectedItems[0].Tag as ProcInfo;
+        }
 
+        private void UpdateStopButton()
+        {
+            var p = Selected();
+            stop.Enabled = !busy && p != null && p.CanStop;
+        }
+
+        private async void LoadProcs()
+        {
+            if (busy || closed) return;
+            SetBusy(true);
+            status.Text = "正在读取手机进程与 CPU 采样…";
+            try {
+                var procs = await Task.Run(() => ReadSnapshot(true));
+                if (closed) return;
+                if (procs.Count == 0) throw new InvalidOperationException("未能读取进程列表，请检查设备连接或系统权限。");
                 allProcs = procs;
-                BuildTree();
+                updated = DateTime.Now.ToString("HH:mm:ss");
+                refreshError = "";
+                BuildList(true);
             }
-            finally { Cursor.Current = Cursors.Default; }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) {
+                if (!closed) {
+                    refreshError = "刷新失败：" + ex.Message + "（保留上次数据）";
+                    status.Text = refreshError;
+                }
+            }
+            finally { if (!closed) SetBusy(false); }
         }
 
-        /// <summary>解析 ps 输出。modern=true 表示 -o PID,PPID,USER,NAME,RSS；false 表示默认列</summary>
-        private static List<ProcInfo> ParsePs(string output, bool modern)
+        private List<ProcInfo> ReadSnapshot(bool withCpu)
         {
-            var procs = new List<ProcInfo>();
-            if (string.IsNullOrEmpty(output)) return procs;
-
-            foreach (var raw in output.Split('\n'))
-            {
-                var line = raw.Trim();
-                if (line.Length == 0) continue;
-                if (line.StartsWith("PID") || line.StartsWith("USER")) continue;
-
-                var parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 4) continue;
-
-                int pid, ppid;
-                long rss = 0;
-                string user, name;
-
-                if (modern)
-                {
-                    // PID PPID USER NAME... RSS
-                    if (!int.TryParse(parts[0], out pid)) continue;
-                    if (!int.TryParse(parts[1], out ppid)) continue;
-                    user = parts[2];
-                    long.TryParse(parts[parts.Length - 1], out rss);
-                    name = string.Join(" ", parts, 3, Math.Max(1, parts.Length - 4));
-                }
-                else
-                {
-                    // USER PID PPID VSZ RSS WCHAN ADDR S NAME...（列数不定，NAME 在最后）
-                    if (!int.TryParse(parts[1], out pid)) continue;
-                    if (!int.TryParse(parts[2], out ppid)) continue;
-                    user = parts[0];
-                    // 老格式里 RSS 通常在第 5 列
-                    if (parts.Length > 4) long.TryParse(parts[4], out rss);
-                    name = parts[parts.Length - 1];
-                }
-
-                if (pid <= 0) continue;
-                procs.Add(new ProcInfo
-                {
-                    Pid = pid,
-                    PPid = ppid,
-                    User = user,
-                    Name = name,
-                    RssKb = rss
-                });
+            // 旧 Android 不支持自定义列时，由 shell 回退；最终失败仍保留退出码。
+            var procs = ParsePs(RunAdb("ps -A -o PID,PPID,USER,RSS,STIME,NAME 2>/dev/null || " +
+                "ps -A -o PID,PPID,USER,NAME,RSS 2>/dev/null || ps -A 2>/dev/null || ps"));
+            if (withCpu && procs.Count > 0) {
+                try { ApplyCpu(procs, RunAdb("top -b -n 2 -d 1 -o PID,%CPU,NAME")); }
+                catch (OperationCanceledException) { throw; }
+                catch { /* CPU 不可读时保留空值，不把未知显示为 0。 */ }
             }
             return procs;
         }
 
-        private void BuildTree()
+        // 与文件操作共用退出码检查、超时和取消清理，避免两套子进程实现产生差异。
+        private string RunAdb(string command)
         {
-            var keyword = (txtFilter.Text ?? "").Trim();
-            var appsOnly = chkAppsOnly.Checked;
-
-            var byPid = allProcs.ToDictionary(p => p.Pid, p => p);
-
-            // 先过筛选
-            var visible = new List<ProcInfo>();
-            foreach (var p in allProcs)
-            {
-                if (appsOnly && !p.IsApp) continue;
-                if (!appsOnly && p.IsKernelThread) continue;   // 保留系统但去掉内核线程，避免上千项
-                if (keyword.Length > 0 && p.Name.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                visible.Add(p);
+            return Transfer.RunFileCommand("-s " + Transfer.Arg(serial) + " shell " + Transfer.Arg(command), 12000, closing.Token);
+        }
+        internal static List<ProcInfo> ParsePs(string output)
+        {
+            var result = new Dictionary<int, ProcInfo>();
+            string[] header = null;
+            foreach (var raw in (output ?? "").Split('\n')) {
+                var parts = Regex.Split(raw.Trim(), @"\s+");
+                if (parts.Length < 4) continue;
+                if ((parts[0] == "PID" || parts[0] == "USER") && parts.Contains("PID") && parts.Contains("USER")) { header = parts; continue; }
+                if (header == null) continue;
+                int pidIndex = Array.IndexOf(header, "PID"), userIndex = Array.IndexOf(header, "USER");
+                int parentIndex = Array.IndexOf(header, "PPID"), rssIndex = Array.IndexOf(header, "RSS");
+                int nameIndex = Array.IndexOf(header, "NAME");
+                if (nameIndex < 0) nameIndex = Array.IndexOf(header, "CMD");
+                if (nameIndex < 0) nameIndex = Array.IndexOf(header, "COMMAND");
+                if (nameIndex < 0 || parts.Length < header.Length) continue;
+                int pid, parent = 0;
+                if (!int.TryParse(parts[pidIndex], out pid) || pid <= 0) continue;
+                if (parentIndex >= 0) int.TryParse(parts[parentIndex], out parent);
+                long rss = -1, parsedRss;
+                // NAME 可含空格；它后面的字段从行末定位。
+                if (rssIndex >= 0) {
+                    var actualRss = rssIndex > nameIndex ? parts.Length - (header.Length - rssIndex) : rssIndex;
+                    if (long.TryParse(parts[actualRss], out parsedRss) && parsedRss >= 0) rss = parsedRss;
+                }
+                int startIndex = Array.IndexOf(header, "STIME");
+                result[pid] = new ProcInfo { Pid = pid, PPid = parent, User = parts[userIndex], RssKb = rss,
+                    Started = startIndex < 0 ? null : parts[startIndex],
+                    Name = string.Join(" ", parts, nameIndex, parts.Length - header.Length + 1) };
             }
-
-            var visiblePids = new HashSet<int>(visible.Select(p => p.Pid));
-
-            tree.BeginUpdate();
-            tree.Nodes.Clear();
-
-            var nodes = new Dictionary<int, TreeNode>();
-            nodesByPkg.Clear();
-
-            // 先建节点
-            foreach (var p in visible.OrderByDescending(p => p.RssKb))
-            {
-                var pkg = PkgOf(p.Name);
-                var display = AppIcons.DisplayName(pkg);
-                var head = string.IsNullOrEmpty(display) ? p.Name : display + "  (" + pkg + ")";
-                var text = head + "   pid " + p.Pid + " · " + p.RssText;
-
-                var node = new TreeNode(text)
-                {
-                    Tag = p,
-                    ForeColor = ColorOf(p),
-                    ImageIndex = EnsureIcon(pkg, p),
-                    ToolTipText = p.Name + "  ·  pid " + p.Pid + "  ·  " + p.User + "  ·  " + p.RssText
-                };
-                nodes[p.Pid] = node;
-
-                if (p.IsApp)
-                {
-                    List<TreeNode> bucket;
-                    if (!nodesByPkg.TryGetValue(pkg, out bucket))
-                    {
-                        bucket = new List<TreeNode>();
-                        nodesByPkg[pkg] = bucket;
-                    }
-                    bucket.Add(node);
-                }
-            }
-
-            // 再挂父子：找最近的"可见"祖先；没有就挂到被筛掉的父进程（灰节点）下，保住层级
-            var visibleAncestors = new Dictionary<int, TreeNode>();
-
-            foreach (var p in visible)
-            {
-                var node = nodes[p.Pid];
-
-                int cur = p.PPid;
-                int firstHidden = 0;
-                int visibleAncestor = 0;
-
-                while (cur > 0)
-                {
-                    if (visiblePids.Contains(cur)) { visibleAncestor = cur; break; }
-
-                    ProcInfo pp;
-                    if (!byPid.TryGetValue(cur, out pp)) break;   // 父进程已不存在
-                    if (firstHidden == 0) firstHidden = cur;
-                    cur = pp.PPid;
-                }
-
-                if (visibleAncestor != 0)
-                {
-                    nodes[visibleAncestor].Nodes.Add(node);
-                }
-                else if (firstHidden != 0)
-                {
-                    TreeNode ghost;
-                    if (!visibleAncestors.TryGetValue(firstHidden, out ghost))
-                    {
-                        var pp = byPid[firstHidden];
-                        ghost = new TreeNode("[已隐藏] " + pp.Name + "  (pid " + pp.Pid + ")")
-                        {
-                            ForeColor = ColorGhost,
-                            ToolTipText = "父进程本身被筛掉了，这里只是为了保留层级"
-                        };
-                        visibleAncestors[firstHidden] = ghost;
-                        tree.Nodes.Add(ghost);
-                    }
-                    ghost.Nodes.Add(node);
-                }
-                else
-                {
-                    tree.Nodes.Add(node);
-                }
-            }
-
-            tree.EndUpdate();
-
-            var totalRss = visible.Sum(p => p.RssKb);
-            var appCount = visible.Count(p => p.IsApp && !p.IsKernelThread);
-            var sysCount = visible.Count(p => !p.IsApp && !p.IsKernelThread);
-            var kernCount = visible.Count(p => p.IsKernelThread);
-
-            lblStatus.Text = string.Format(
-                "共 {0} 个（应用 {1} · 系统 {2} · 内核 {3}）／全部 {4} 个 · RSS 合计 {5:0.0} MB（含共享内存，偏大）",
-                visible.Count, appCount, sysCount, kernCount, allProcs.Count, totalRss / 1024.0);
-
-            foreach (TreeNode n in tree.Nodes) n.Expand();
-            StartIconFetch();
+            return result.Values.ToList();
         }
 
-        private static string PkgOf(string name)
+        internal static void ApplyCpu(List<ProcInfo> procs, string output)
         {
-            if (string.IsNullOrEmpty(name)) return "";
-            var i = name.IndexOf(':');
-            return i > 0 ? name.Substring(0, i) : name;
+            var readings = new Dictionary<int, KeyValuePair<string, double>>();
+            int frames = 0;
+            foreach (var raw in (output ?? "").Split('\n')) {
+                var parts = Regex.Split(raw.Trim(), @"\s+");
+                if (Regex.IsMatch(raw.Replace('[', ' ').Replace(']', ' ').Trim(), @"^PID\s+%CPU\s+NAME$")) {
+                    frames++;
+                    readings.Clear();
+                    continue;
+                }
+                int pid; double value;
+                if (frames == 0 || parts.Length < 3 || !int.TryParse(parts[0], out pid) ||
+                    !double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out value) ||
+                    double.IsNaN(value) || double.IsInfinity(value) || value < 0) continue;
+                readings[pid] = new KeyValuePair<string, double>(string.Join(" ", parts, 2, parts.Length - 2), value);
+            }
+            foreach (var p in procs) {
+                KeyValuePair<string, double> value;
+                p.Cpu = frames >= 2 && readings.TryGetValue(p.Pid, out value) && value.Key == p.Name ? (double?)value.Value : null;
+            }
         }
 
-        /// <summary>取/分配图标索引：应用用真图标或首字母头像，系统/内核用灰色标签</summary>
-        private int EnsureIcon(string pkg, ProcInfo p)
+        internal static List<ProcInfo> VisibleProcs(IEnumerable<ProcInfo> procs, string keyword, bool onlyApps, int column, bool desc)
         {
-            int idx;
-            if (iconIndexByPkg.TryGetValue(pkg, out idx)) return idx;
-
-            Image img;
-            if (p.IsApp)
-            {
-                img = AppIcons.GetOrAvatar(pkg);
-            }
-            else if (p.IsKernelThread)
-            {
-                img = AppIcons.MakeBadge("核", Color.FromArgb(150, 150, 150));
-            }
-            else
-            {
-                img = AppIcons.MakeBadge("系", Color.FromArgb(160, 120, 60));
-            }
-
-            idx = iconList.Images.Count;
-            iconList.Images.Add(img);
-            iconIndexByPkg[pkg] = idx;
-            return idx;
+            var result = procs.Where(p => (!onlyApps || p.IsApp) &&
+                (p.Name.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 p.DisplayName.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 p.Pid.ToString().Contains(keyword))).ToList();
+            result.Sort((a, b) => {
+                int c;
+                // 缺失数据始终排在末尾。
+                if (column == 3 && a.Cpu.HasValue != b.Cpu.HasValue) return a.Cpu.HasValue ? -1 : 1;
+                if (column == 4 && (a.RssKb >= 0) != (b.RssKb >= 0)) return a.RssKb >= 0 ? -1 : 1;
+                switch (column) {
+                    case 0: c = string.Compare(a.DisplayName, b.DisplayName, StringComparison.CurrentCultureIgnoreCase); break;
+                    case 1: c = string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase); break;
+                    case 2: c = a.Pid.CompareTo(b.Pid); break;
+                    case 3: c = Nullable.Compare(a.Cpu, b.Cpu); break;
+                    default: c = a.RssKb.CompareTo(b.RssKb); break;
+                }
+                return c == 0 ? a.Pid.CompareTo(b.Pid) : (desc ? -c : c);
+            });
+            return result;
         }
 
-        private readonly HashSet<string> iconRequested = new HashSet<string>();
-
-        /// <summary>后台去 APK 里抠真实图标，抠到就替换头像</summary>
-        private void StartIconFetch()
+        private void BuildList(bool preserveScroll = false)
         {
-            var pkgs = allProcs.Where(p => p.IsApp)
-                               .Select(p => PkgOf(p.Name))
-                               .Where(p => p.Length > 0)
-                               .Distinct()
-                               .Where(p => !iconRequested.Contains(p))
-                               .ToList();
-
-            if (pkgs.Count == 0) return;
-            foreach (var p in pkgs) iconRequested.Add(p);
-
-            AppIcons.FetchAll(serial, pkgs,
-                pkg =>
-                {
-                    if (IsDisposed) return;
-                    try
-                    {
-                        BeginInvoke(new Action(() =>
-                        {
-                            List<TreeNode> nodes;
-                            if (!nodesByPkg.TryGetValue(pkg, out nodes)) return;
-
-                            var img = AppIcons.Get(pkg);
-                            if (img == null) return;
-
-                            var nodesForPkg = nodes;
-                            int idx = iconList.Images.Count;
-                            iconList.Images.Add(img);
-                            iconIndexByPkg[pkg] = idx;
-                            foreach (var n in nodesForPkg) n.ImageIndex = idx;
-                        }));
-                    }
-                    catch { }
-                },
-                () => { });
+            var selected = Selected();
+            var top = !preserveScroll || list.TopItem == null ? null : list.TopItem.Tag as ProcInfo;
+            var visible = VisibleProcs(allProcs, filter.Text.Trim(), appsOnly.Checked, sortColumn, descending);
+            var titles = new[] { "应用名称", "进程名 / 包名", "PID", "CPU %", "内存 MB" };
+            for (int i = 0; i < titles.Length; i++) list.Columns[i].Text = titles[i] + (i == sortColumn ? (descending ? " ▼" : " ▲") : "");
+            list.BeginUpdate();
+            try {
+                list.Items.Clear();
+                foreach (var p in visible) {
+                    var item = new ListViewItem(new[] { p.DisplayName, p.Name, p.Pid.ToString(),
+                        p.Cpu.HasValue ? p.Cpu.Value.ToString("0.0") : "—",
+                        p.RssKb < 0 ? "—" : (p.RssKb / 1024.0).ToString("0.0") }) {
+                        Tag = p, ToolTipText = p.Name + " · " + p.User,
+                        ForeColor = p.IsApp ? Color.FromArgb(0, 85, 160) : Color.DimGray
+                    };
+                    list.Items.Add(item);
+                    if (selected != null && SameProcess(selected, p)) { item.Selected = true; item.Focused = true; }
+                }
+            }
+            finally { list.EndUpdate(); }
+            if (top != null) {
+                var topItem = list.Items.Cast<ListViewItem>().FirstOrDefault(item => SameProcess(top, (ProcInfo)item.Tag));
+                if (topItem != null) list.TopItem = topItem;
+            }
+            status.Text = refreshError.Length > 0 ? refreshError : string.Format(
+                "显示 {0} / {1} 个进程 · 所列 RSS 合计 {2:0.0} MB（共享部分会重复计算） · 更新 {3}\r\n{4}",
+                visible.Count, allProcs.Count, visible.Where(p => p.RssKb >= 0).Sum(p => p.RssKb) / 1024.0, updated,
+                allProcs.Any(p => p.Cpu.HasValue) ? "点击 CPU 或内存列标题排序；搜索支持中文应用名、包名和 PID。" : "CPU 暂不可读，以 — 显示；点击内存列标题排序。");
+            UpdateStopButton();
         }
 
-        private void KillSelected()
+        internal static bool SameProcess(ProcInfo a, ProcInfo b)
         {
-            if (tree.SelectedNode == null) return;
-            var p = tree.SelectedNode.Tag as ProcInfo;
-            if (p == null) return;
+            return a.Pid == b.Pid && a.Name == b.Name && a.User == b.User && a.Started == b.Started;
+        }
 
-            var isApp = p.IsApp && p.Name != null && p.Name.Contains(".");
-            var text = isApp
-                ? "要强停应用 " + p.Name + " 吗？\r\n\r\n（am force-stop，等同于系统里强行停止）"
-                : "要结束进程 " + p.Name + "（pid " + p.Pid + "）吗？\r\n\r\n注意：系统进程通常会拒绝。";
-
-            if (MessageBox.Show(text, "结束进程", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
-                return;
-
-            Cursor.Current = Cursors.WaitCursor;
-            string result;
-            try
-            {
-                result = isApp
-                    ? Program.RunAdb("-s " + serial + " shell am force-stop " + p.Name, 30000)
-                    : Program.RunAdb("-s " + serial + " shell kill -9 " + p.Pid, 15000);
+        internal static bool PackageMatchesUser(ProcInfo process, string packageOutput)
+        {
+            var user = Regex.Match(process.User ?? "", @"^u(\d+)_a(\d+)$");
+            long profile, app;
+            if (!process.CanStop || !user.Success ||
+                !long.TryParse(user.Groups[1].Value, out profile) || profile > 21474 ||
+                !long.TryParse(user.Groups[2].Value, out app) || app > 89999) return false;
+            long expected = profile * 100000 + 10000 + app;
+            foreach (var line in (packageOutput ?? "").Split('\n')) {
+                var package = Regex.Match(line.Trim(), @"^package:" + Regex.Escape(process.Package) + @"\s+uid:(\d+)$");
+                long actual;
+                if (package.Success && long.TryParse(package.Groups[1].Value, out actual) && actual == expected) return true;
             }
-            finally { Cursor.Current = Cursors.Default; }
-
-            MessageBox.Show("命令返回：\r\n" + (string.IsNullOrWhiteSpace(result) ? "（无输出，通常代表成功）" : result.Trim()),
-                "结束进程", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            LoadProcs();
+            return false;
+        }
+        private async void StopSelected()
+        {
+            var selected = Selected();
+            if (busy || closed || selected == null || !selected.CanStop) return;
+            // 确认期间暂停刷新，固定用户正在确认的应用身份。
+            SetBusy(true);
+            try {
+                if (MessageBox.Show(this, "强行停止「" + selected.DisplayName + "」？\r\n" + selected.Package +
+                    "\r\n\r\n该应用的所有进程和服务都会停止，未保存的内容可能丢失。", "强行停止应用",
+                    MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
+                var message = await Task.Run(() => {
+                    var current = ReadSnapshot(false).FirstOrDefault(p => p.Pid == selected.Pid);
+                    if (current == null || !SameProcess(selected, current)) return "进程已退出或身份已变化，请刷新后重新选择。";
+                    // 自定义进程名不一定是所属包名，必须再以包管理器的精确包名和 UID 验证。
+                    var profile = selected.User.Substring(1, selected.User.IndexOf('_' ) - 1);
+                    if (!PackageMatchesUser(selected, RunAdb("pm list packages -U --user " + profile + " " + selected.Package)))
+                        return "无法确认该进程属于此应用包，已取消停止操作。";
+                    // 只对验证后的原始包名操作；绝不对可能复用的 PID 发送 kill。
+                    var response = RunAdb("am force-stop --user " + selected.User.Substring(1, selected.User.IndexOf('_') - 1) + " " + selected.Package);
+                    return string.IsNullOrWhiteSpace(response) ? "已发送强行停止命令。" : "手机返回：\r\n" + response.Trim();
+                });
+                if (!closed) MessageBox.Show(this, message, "强行停止应用", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { if (!closed) MessageBox.Show(this, ex.Message, "操作失败", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            finally { if (!closed) SetBusy(false); }
+            if (!closed) LoadProcs();
         }
     }
 }

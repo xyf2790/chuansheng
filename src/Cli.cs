@@ -14,7 +14,7 @@ namespace PhoneAudioTray
 {
     internal static class Ipc
     {
-        public const string PipeName = "PhoneAudioTray.IPC";
+        internal static string PipeName = "PhoneAudioTray.IPC";
 
         // ---------- 服务端（托盘程序里跑）----------
         public static void StartServer()
@@ -25,30 +25,12 @@ namespace PhoneAudioTray
                 {
                     try
                     {
-                        using (var server = new NamedPipeServerStream(PipeName, PipeDirection.InOut, 1,
-                            PipeTransmissionMode.Message, PipeOptions.None))
-                        {
-                            server.WaitForConnection();
-                            string line;
-                            using (var reader = new StreamReader(server, Encoding.UTF8, false, 1024, true))
-                                line = reader.ReadLine();
-
-                            string result;
-                            try
-                            {
-                                // 交给 UI 线程的定时器去执行（避免句柄未建时 Invoke 失败）
-                                var req = new CommandRequest { Line = line };
-                                Program.PendingCommands.Enqueue(req);
-                                result = req.Done.Wait(30000) ? (req.Result ?? "OK") : "ERR 执行超时（可能有弹窗挡住了）";
-                            }
-                            catch (Exception ex) { result = "ERR " + ex.Message; }
-
-                            using (var writer = new StreamWriter(server, new UTF8Encoding(false), 1024, true) { AutoFlush = true })
-                            {
-                                writer.WriteLine(result ?? "OK");
-                                writer.Flush();
-                            }
-                        }
+                        var server = new NamedPipeServerStream(PipeName, PipeDirection.InOut,
+                            NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Message, PipeOptions.Asynchronous);
+                        try { server.WaitForConnection(); }
+                        catch { server.Dispose(); throw; }
+                        // 每个客户端独立等待；传输或弹窗不会挡住另一个客户端的 ping。
+                        ThreadPool.QueueUserWorkItem(s => HandleConnection((NamedPipeServerStream)s), server);
                     }
                     catch { Thread.Sleep(500); }
                 }
@@ -57,19 +39,65 @@ namespace PhoneAudioTray
             thread.Start();
         }
 
+        private static void HandleConnection(NamedPipeServerStream server)
+        {
+            using (server)
+            {
+                try
+                {
+                    string line;
+                    using (var reader = new StreamReader(server, Encoding.UTF8, false, 1024, true))
+                    {
+                        var read = reader.ReadLineAsync();
+                        if (!read.Wait(15000)) return;
+                        line = read.Result;
+                    }
+                    string result;
+                    if (line == "ping") result = "OK";
+                    else
+                    {
+                        var req = new CommandRequest { Line = line };
+                        Program.PendingCommands.Enqueue(req);
+                        result = WaitForCommand(req, 30000);
+                    }
+                    using (var writer = new StreamWriter(server, new UTF8Encoding(false), 1024, true) { AutoFlush = true })
+                        writer.WriteLine(result);
+                }
+                catch { /* 客户端退出不影响其他请求或托盘程序。 */ }
+            }
+        }
+
+        private static string WaitForCommand(CommandRequest request, int queueTimeoutMs)
+        {
+            if (!request.Done.Wait(queueTimeoutMs))
+            {
+                if (request.CancelQueued()) return "ERR 排队超时，命令未执行，请在当前操作完成后重试";
+                // 已开始的传输必须返回真实结果，不能在传输中途报告失败。
+                request.Done.Wait();
+            }
+            return request.Result ?? "OK";
+        }
+
         // ---------- 客户端 ----------
-        public static string Send(string command, int timeoutMs = 15000)
+        public static string Send(string command, int timeoutMs = Timeout.Infinite)
         {
             try
             {
-                using (var client = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut))
+                var watch = Stopwatch.StartNew();
+                using (var client = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
                 {
-                    client.Connect(timeoutMs);
+                    client.Connect(timeoutMs == Timeout.Infinite ? 15000 : timeoutMs);
                     using (var writer = new StreamWriter(client, new UTF8Encoding(false), 1024, true) { AutoFlush = true })
                         writer.WriteLine(command);
                     // 服务端可能返回多行（比如 --help），必须读到 EOF 再返回
                     using (var reader = new StreamReader(client, Encoding.UTF8, false, 1024, true))
-                        return (reader.ReadToEnd() ?? "").TrimEnd('\r', '\n');
+                    {
+                        var read = reader.ReadToEndAsync();
+                        var remaining = timeoutMs == Timeout.Infinite ? Timeout.Infinite : Math.Max(0, timeoutMs - (int)Math.Min(int.MaxValue, watch.ElapsedMilliseconds));
+                        if (!read.Wait(remaining)) return "ERR 响应超时，执行结果未确认，请勿重复提交操作";
+                        var response = (read.Result ?? "").TrimEnd('\r', '\n');
+                        return response.Length == 0 ? "ERR 程序连接已断开，执行结果未确认" : response;
+                    }
                 }
             }
             catch (Exception ex)
@@ -92,6 +120,9 @@ namespace PhoneAudioTray
         public string Result;
         public readonly System.Threading.ManualResetEventSlim Done =
             new System.Threading.ManualResetEventSlim(false);
+        private int state;
+        public bool TryStart() { return Interlocked.CompareExchange(ref state, 1, 0) == 0; }
+        public bool CancelQueued() { return Interlocked.CompareExchange(ref state, 2, 0) == 0; }
     }
 
     internal static class Cli
@@ -287,7 +318,8 @@ namespace PhoneAudioTray
                     {
                         var path = Arg(a, 1);
                         if (path == null) return "ERR-push";
-                        return "push " + path;
+                        try { return "push " + Path.GetFullPath(path); }
+                        catch { return "ERR-push"; }
                     }
 
                 case "pull":
@@ -356,8 +388,8 @@ namespace PhoneAudioTray
                         {
                             var usb = Program.ListDevices().Where(d => !d.Contains(":")).ToList();
                             if (usb.Count == 0) return "ERR 没有 USB 设备（检查数据线和「允许 USB 调试」）";
-                            Program.StartSession(usb[0], "USB");
-                            return "OK 已连接 " + usb[0];
+                            return Program.StartSession(usb[0], "USB", true, false)
+                                ? "OK 已启动连接 " + usb[0] : "ERR scrcpy 启动失败，请检查程序文件与调试日志";
                         }
 
                     case "pair":
@@ -379,7 +411,9 @@ namespace PhoneAudioTray
                             }
                             if (target == null) return "OK 配对成功，但暂时没发现连接地址，请在手机上保持无线调试页面再试 WiFi 连接";
                             string detail;
-                            if (Program.TryConnect(target, out detail)) { Program.StartSession(target, "WiFi"); return "OK 配对并已连接 " + target; }
+                            if (Program.TryConnect(target, out detail))
+                                return Program.StartSession(target, "WiFi", true, false)
+                                    ? "OK 配对成功，已启动连接 " + target : "ERR 配对成功，但 scrcpy 启动失败，请检查调试日志";
                             return "OK 已配对，但连接失败：" + detail.Trim();
                         }
 
@@ -389,13 +423,13 @@ namespace PhoneAudioTray
                             string detail;
                             if (Program.TryConnect(arg, out detail))
                             {
-                                Program.StartSession(arg, "WiFi");
-                                return "OK 已连接 " + arg;
+                                return Program.StartSession(arg, "WiFi", true, false)
+                                    ? "OK 已启动连接 " + arg : "ERR ADB 已连接，但 scrcpy 启动失败，请检查调试日志";
                             }
                             return "ERR 连接失败：" + detail.Trim();
                         }
-                        Program.ShowConnectDialog(true);
-                        return "OK 已打开连接窗口";
+                        Program.Post(() => Program.ShowConnectDialog(true));
+                        return "OK 已请求打开连接窗口";
 
                     case "devices":
                         {
@@ -468,16 +502,17 @@ namespace PhoneAudioTray
                     case "volume-phone":
                         {
                             int v;
-                            if (!int.TryParse(arg, out v)) return "ERR 音量要 0-100 的数字";
-                            Program.SetPhoneVolumePct(v);
-                            return "OK 手机音量 → " + v + "%";
+                            if (!int.TryParse(arg, out v) || v < 0 || v > 100) return "ERR 音量要 0-100 的数字";
+                            return Program.SetPhoneVolumePct(v)
+                                ? "OK 手机音量 → " + Program.PhoneVolumePct + "%"
+                                : "ERR 手机音量未修改完成，请确认设备连接、音量读取权限及手机音量限制";
                         }
 
                     case "volume-pc":
                         {
                             int v;
-                            if (!int.TryParse(arg, out v)) return "ERR 音量要 0-100 的数字";
-                            Program.SetPcVolume(Math.Max(0, Math.Min(100, v)) / 100f);
+                            if (!int.TryParse(arg, out v) || v < 0 || v > 100) return "ERR 音量要 0-100 的数字";
+                            Program.SetPcVolume(v / 100f);
                             return "OK 电脑侧音量 → " + v + "%";
                         }
 
@@ -490,16 +525,16 @@ namespace PhoneAudioTray
                         }
 
                     case "pull":
-                        Program.OpenFileBrowser();
-                        return "OK 已打开「从手机取文件」窗口";
+                        Program.Post(Program.OpenFileBrowser);
+                        return "OK 已请求打开「从手机取文件」窗口";
 
                     case "files":
-                        Program.OpenFileBrowser();
-                        return "OK 已打开文件浏览窗口";
+                        Program.Post(Program.OpenFileBrowser);
+                        return "OK 已请求打开文件浏览窗口";
 
                     case "ps":
-                        Program.OpenProcessTree();
-                        return "OK 已打开进程树窗口";
+                        Program.Post(Program.OpenProcessTree);
+                        return "OK 已请求打开手机任务管理器";
 
                     case "stop":
                         Program.StopLatest();
@@ -510,9 +545,8 @@ namespace PhoneAudioTray
                         return "OK 已停止全部";
 
                     case "exit":
-                        Program.ShutdownAll();
-                        Application.Exit();
-                        return "OK 已退出";
+                        Program.Post(() => { Program.ShutdownAll(); Application.Exit(); });
+                        return "OK 已请求退出";
 
                     case "help":
                         return Program.CommandHelp();
@@ -531,9 +565,10 @@ namespace PhoneAudioTray
         {
             if (string.IsNullOrEmpty(arg)) return !current;           // 省略 = toggle
             var a = arg.ToLowerInvariant();
+            if (a == "toggle" || a == "切换") return !current;
             if (a == "on" || a == "1" || a == "true" || a == "开") return true;
             if (a == "off" || a == "0" || a == "false" || a == "关") return false;
-            return !current;
+            throw new ArgumentException("开关参数应为 on、off 或 toggle");
         }
     }
 }

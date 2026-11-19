@@ -1,10 +1,12 @@
-// FileBrowser.cs — 手机文件浏览（目录树 + 排序 + 搜索 + 快捷入口 + 删除 + 回收站）
+﻿// FileBrowser.cs — 手机文件浏览（目录树 + 排序 + 搜索 + 快捷入口 + 删除 + 回收站）
 using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace PhoneAudioTray
@@ -20,7 +22,19 @@ namespace PhoneAudioTray
         private TextBox txtSearch;
         private CheckBox chkSub;
         private ImageList icons;
+        private Button btnPreview;
         private bool suppressTreeEvent;
+        private readonly CancellationTokenSource lifetime = new CancellationTokenSource();
+        private readonly Dictionary<TreeNode, CancellationTokenSource> treeLoads = new Dictionary<TreeNode, CancellationTokenSource>();
+        private CancellationTokenSource directoryLoad;
+        private CancellationTokenSource renderLoad;
+        private bool closing;
+        private bool loading;
+        private int directoryVersion;
+        private int renderVersion;
+        private List<RemoteEntry> shownEntries = new List<RemoteEntry>();
+        private bool showParent;
+        private string resultWarning = "";
 
         private List<RemoteEntry> currentEntries = new List<RemoteEntry>();
         private bool subtreeResultMode;
@@ -76,7 +90,7 @@ namespace PhoneAudioTray
             Controls.Add(btnQuick);
 
             txtSearch = new TextBox { Left = 500, Top = 40, Width = 300 };
-            txtSearch.TextChanged += (s, e) => { if (!subtreeResultMode) Render(); };
+            txtSearch.TextChanged += (s, e) => { if (subtreeResultMode) LoadDir(); else Render(); };
             Controls.Add(txtSearch);
 
             chkSub = new CheckBox { Left = 806, Top = 42, Width = 88, Text = "含子目录" };
@@ -102,6 +116,17 @@ namespace PhoneAudioTray
                 HideSelection = false, ShowLines = true, ShowPlusMinus = true
             };
             tree.BeforeExpand += Tree_BeforeExpand;
+            tree.AfterCollapse += (s, e) =>
+            {
+                CancellationTokenSource pending;
+                if (treeLoads.TryGetValue(e.Node, out pending))
+                {
+                    treeLoads.Remove(e.Node);
+                    pending.Cancel();
+                    e.Node.Nodes.Clear();
+                    e.Node.Nodes.Add(new TreeNode("…"));
+                }
+            };
             tree.AfterSelect += Tree_AfterSelect;
             Controls.Add(tree);
 
@@ -110,15 +135,18 @@ namespace PhoneAudioTray
             {
                 Left = 244, Top = 72, Width = 750, Height = 486,
                 View = View.Details, FullRowSelect = true, GridLines = true,
-                MultiSelect = true, SmallImageList = icons, HideSelection = false
+                MultiSelect = true, SmallImageList = icons, HideSelection = false, VirtualMode = true
             };
-            list.Columns.Add("名称", 360);
-            list.Columns.Add("类型", 80);
+            list.Columns.Add("名称", 300);
+            list.Columns.Add("类型", 140);
             list.Columns.Add("修改时间", 130);
             list.Columns.Add("大小", 120);
             list.ColumnClick += List_ColumnClick;
             list.DoubleClick += (s, e) => OpenSelected();
             list.KeyDown += List_KeyDown;
+            list.RetrieveVirtualItem += RetrieveItem;
+            list.SelectedIndexChanged += (s, e) => UpdatePreviewButton();
+            list.VirtualItemsSelectionRangeChanged += (s, e) => UpdatePreviewButton();
             Controls.Add(list);
 
             // ---- 底部 ----
@@ -141,11 +169,15 @@ namespace PhoneAudioTray
             };
             Controls.Add(btnTrash);
 
+            btnPreview = new Button { Left = 568, Top = 568, Width = 110, Height = 32, Text = "预览图片/视频", Enabled = false };
+            btnPreview.Click += (s, e) => PreviewSelected();
+            Controls.Add(btnPreview);
+
             var hint = new Label
             {
                 Left = 244, Top = 610, Width = 600,
                 ForeColor = Color.DimGray,
-                Text = "点列头排序；双击文件夹进入；Delete = 移到回收站；Backspace = 上一级。"
+                Text = "双击图片/视频预览，文件夹进入；空格预览；Delete 移到回收站；Backspace 上一级。"
             };
             Controls.Add(hint);
 
@@ -158,6 +190,24 @@ namespace PhoneAudioTray
                 BuildTree();
                 LoadDir();
             };
+            FormClosed += (s, e) => CancelPending();
+        }
+
+        private void CancelPending()
+        {
+            if (closing) return;
+            closing = true;
+            lifetime.Cancel();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                CancelPending();
+            }
+            base.Dispose(disposing);
+            if (disposing && icons != null) { icons.Dispose(); icons = null; }
         }
 
         // ---------- 图标 ----------
@@ -214,26 +264,47 @@ namespace PhoneAudioTray
             suppressTreeEvent = false;
         }
 
-        private void Tree_BeforeExpand(object sender, TreeViewCancelEventArgs e)
+        private async void Tree_BeforeExpand(object sender, TreeViewCancelEventArgs e)
         {
+            if (closing) return;
             var node = e.Node;
             if (node.Nodes.Count == 1 && node.Nodes[0].Text == "…")
             {
-                node.Nodes.Clear();
                 var path = node.Tag as string;
                 if (string.IsNullOrEmpty(path)) return;
-
-                Cursor.Current = Cursors.WaitCursor;
+                var request = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+                treeLoads[node] = request;
+                node.Nodes[0].Text = "正在加载…";
                 try
                 {
-                    foreach (var d in Transfer.ListSubDirs(serial, path))
+                    var dirs = await Task.Run(() => Transfer.ListSubDirs(serial, path, request.Token), request.Token);
+                    if (closing || request.IsCancellationRequested || node.TreeView != tree) return;
+                    tree.BeginUpdate();
+                    node.Nodes.Clear();
+                    foreach (var d in dirs)
                     {
                         var child = new TreeNode(d) { Tag = path.TrimEnd('/') + "/" + d };
                         child.Nodes.Add(new TreeNode("…"));
                         node.Nodes.Add(child);
                     }
+                    tree.EndUpdate();
                 }
-                finally { Cursor.Current = Cursors.Default; }
+                catch (OperationCanceledException) { }
+                catch (Exception ex)
+                {
+                    if (!closing && !request.IsCancellationRequested && node.TreeView == tree)
+                    {
+                        node.Nodes.Clear();
+                        node.Nodes.Add(new TreeNode("…"));
+                        lblPath.Text = "目录树加载失败：" + ex.Message;
+                    }
+                }
+                finally
+                {
+                    CancellationTokenSource active;
+                    if (treeLoads.TryGetValue(node, out active) && active == request) treeLoads.Remove(node);
+                    request.Dispose();
+                }
             }
         }
 
@@ -257,19 +328,20 @@ namespace PhoneAudioTray
             Render();
         }
 
-        private int CompareEntries(RemoteEntry a, RemoteEntry b)
+        private static int CompareEntries(RemoteEntry a, RemoteEntry b, int column, bool ascending)
         {
             int r = b.IsDir.CompareTo(a.IsDir);   // 文件夹永远在前
             if (r != 0) return r;
 
-            switch (sortColumn)
+            switch (column)
             {
                 case 0: r = string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase); break;
-                case 1: r = string.Compare(a.IsDir ? "文件夹" : "文件", b.IsDir ? "文件夹" : "文件", StringComparison.Ordinal); break;
+                case 1: r = string.Compare(a.TypeText, b.TypeText, StringComparison.Ordinal); break;
                 case 2: r = string.Compare(a.Modified ?? "", b.Modified ?? "", StringComparison.Ordinal); break;
                 case 3: r = a.Size.CompareTo(b.Size); break;
             }
-            return sortAsc ? r : -r;
+            if (r == 0) r = string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+            return ascending ? r : -r;
         }
 
         private void UpdateHeaders()
@@ -296,136 +368,157 @@ namespace PhoneAudioTray
 
         private void LoadDir()
         {
-            Cursor.Current = Cursors.WaitCursor;
-            try
-            {
-                currentEntries = Transfer.ListRemote(serial, currentPath);
-                subtreeResultMode = false;
-                Render();
-            }
-            finally { Cursor.Current = Cursors.Default; }
+            var path = currentPath;
+            StartLoad(token => Transfer.ListRemote(serial, path, token), false, "");
         }
 
-        private void Render()
+        private async void StartLoad(Func<CancellationToken, List<RemoteEntry>> load, bool search, string keyword, Func<string> warning = null)
         {
-            lblPath.Text = subtreeResultMode
-                ? "搜索结果：" + txtSearch.Text + "（" + currentPath + " 及子目录）"
-                : currentPath;
-
-            UpdateHeaders();
-
-            var keyword = (txtSearch.Text ?? "").Trim();
-
-            list.BeginUpdate();
-            list.Items.Clear();
-
-            if (!subtreeResultMode && currentPath != "/")
-                list.Items.Add(new ListViewItem(new[] { "..", "文件夹", "", "" }) { ImageIndex = 0, Tag = ".." });
-
-            var shown = currentEntries;
-            if (!subtreeResultMode && keyword.Length > 0)
+            if (closing) return;
+            if (directoryLoad != null) directoryLoad.Cancel();
+            if (renderLoad != null) renderLoad.Cancel();
+            var request = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            directoryLoad = request;
+            var version = ++directoryVersion;
+            ++renderVersion;
+            loading = true;
+            subtreeResultMode = search;
+            resultWarning = "";
+            currentEntries = new List<RemoteEntry>();
+            SetRows(new List<RemoteEntry>(), false);
+            lblPath.Text = (search ? "正在搜索：" + keyword + "（" + currentPath + " 及子目录）" : "正在加载：" + currentPath);
+            try
             {
-                shown = currentEntries
-                    .Where(e => e.Name.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
-                    .ToList();
+                var entries = await Task.Run(() => load(request.Token), request.Token);
+                if (closing || request.IsCancellationRequested || version != directoryVersion) return;
+                currentEntries = entries;
+                resultWarning = warning == null ? "" : warning();
+                loading = false;
+                Render();
             }
-
-            shown = shown.OrderBy(e => e, Comparer<RemoteEntry>.Create(CompareEntries)).ToList();
-
-            foreach (var e in shown)
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
             {
-                list.Items.Add(new ListViewItem(new[]
+                if (!closing && !request.IsCancellationRequested && version == directoryVersion)
                 {
-                    e.Name,
-                    e.IsDir ? "文件夹" : "文件",
-                    e.Modified ?? "",
-                    e.SizeText
-                })
-                { ImageIndex = e.IsDir ? 0 : 1, Tag = e });
+                    loading = false;
+                    lblPath.Text = "加载失败：" + ex.Message;
+                }
             }
+            finally
+            {
+                if (directoryLoad == request) directoryLoad = null;
+                request.Dispose();
+            }
+        }
 
-            list.EndUpdate();
+        private async void Render()
+        {
+            if (closing || loading) return;
+            if (renderLoad != null) renderLoad.Cancel();
+            var request = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            renderLoad = request;
+            var version = ++renderVersion;
+            var entries = currentEntries;
+            var keyword = (txtSearch.Text ?? "").Trim();
+            var search = subtreeResultMode;
+            var path = currentPath;
+            var column = sortColumn;
+            var ascending = sortAsc;
+            UpdateHeaders();
+            try
+            {
+                var rows = await Task.Run(() =>
+                {
+                    var shown = new List<RemoteEntry>(entries.Count);
+                    foreach (var entry in entries)
+                    {
+                        request.Token.ThrowIfCancellationRequested();
+                        if (search || keyword.Length == 0 || entry.Name.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
+                            shown.Add(entry);
+                    }
+                    shown.Sort((a, b) => CompareEntries(a, b, column, ascending));
+                    request.Token.ThrowIfCancellationRequested();
+                    return shown;
+                }, request.Token);
+                if (closing || request.IsCancellationRequested || version != renderVersion) return;
+                SetRows(rows, !search && path != "/");
+                lblPath.Text = (resultWarning.Length == 0 ? "" : resultWarning + "；")
+                    + (search ? "搜索结果：" + keyword + "（" + path + " 及子目录）" : path)
+                    + " — " + rows.Count + " 个项目";
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                if (!closing && !request.IsCancellationRequested && version == renderVersion)
+                    lblPath.Text = "显示失败：" + ex.Message;
+            }
+            finally
+            {
+                if (renderLoad == request) renderLoad = null;
+                request.Dispose();
+            }
+        }
+
+        private void SetRows(List<RemoteEntry> rows, bool parent)
+        {
+            list.BeginUpdate();
+            try
+            {
+                list.SelectedIndices.Clear();
+                list.VirtualListSize = 0;
+                shownEntries = rows;
+                showParent = parent;
+                list.VirtualListSize = rows.Count + (parent ? 1 : 0);
+                list.Invalidate();
+            }
+            finally { list.EndUpdate(); }
+            UpdatePreviewButton();
+        }
+
+        private RemoteEntry EntryAt(int index)
+        {
+            index -= showParent ? 1 : 0;
+            return index >= 0 && index < shownEntries.Count ? shownEntries[index] : null;
+        }
+
+        private void RetrieveItem(object sender, RetrieveVirtualItemEventArgs e)
+        {
+            var entry = EntryAt(e.ItemIndex);
+            e.Item = entry == null
+                ? new ListViewItem(new[] { "..", "文件夹", "", "" }) { ImageIndex = 0 }
+                : new ListViewItem(new[] { entry.Name, entry.TypeText, entry.Modified ?? "", entry.SizeText })
+                    { ImageIndex = entry.IsDir ? 0 : 1 };
+        }
+
+        private void UpdatePreviewButton()
+        {
+            if (btnPreview == null) return;
+            // Count first: Ctrl+A must not allocate/scan a list on every selection event.
+            var entry = list.SelectedIndices.Count == 1 ? EntryAt(list.SelectedIndices[0]) : null;
+            btnPreview.Enabled = entry != null && !entry.IsDir && !entry.IsLink && !entry.IsUnavailable && MediaPreview.CanPreview(entry.FullPath);
         }
 
         // ---------- 搜索 ----------
         private void DoSearch()
         {
             var keyword = (txtSearch.Text ?? "").Trim();
-            if (keyword.Length == 0)
-            {
-                LoadDir();
-                return;
-            }
-
-            if (!chkSub.Checked)
-            {
-                // 只过滤当前目录，纯本地筛选
-                subtreeResultMode = false;
-                Render();
-                return;
-            }
-
-            Cursor.Current = Cursors.WaitCursor;
-            try
-            {
-                var results = new List<RemoteEntry>();
-                var kw = keyword.Replace("'", "");
-
-                var dirs = Program.RunAdb("-s " + serial + " shell find " + Transfer.Q(currentPath)
-                    + " -maxdepth 4 -type d -iname '*" + kw + "*'", 60000);
-                foreach (var line in dirs.Split('\n'))
-                {
-                    var p = line.Trim();
-                    if (p.Length == 0 || p.StartsWith("find:")) continue;
-                    results.Add(new RemoteEntry
-                    {
-                        Name = p,
-                        IsDir = true,
-                        Modified = "",
-                        Size = 0,
-                        FullPath = p
-                    });
-                }
-
-                var files = Program.RunAdb("-s " + serial + " shell find " + Transfer.Q(currentPath)
-                    + " -maxdepth 4 -type f -iname '*" + kw + "*'", 60000);
-                foreach (var line in files.Split('\n'))
-                {
-                    var p = line.Trim();
-                    if (p.Length == 0 || p.StartsWith("find:")) continue;
-                    results.Add(new RemoteEntry
-                    {
-                        Name = p,
-                        IsDir = false,
-                        Modified = "",
-                        Size = 0,
-                        FullPath = p
-                    });
-                }
-
-                // find 不支持时（老 Android 的 toybox 没 -iname）退回逐层扫描
-                if (results.Count == 0)
-                    results = Transfer.SearchRecursive(serial, currentPath, keyword, 3, 300);
-
-                currentEntries = results;
-                subtreeResultMode = true;
-                Render();
-
-                if (results.Count == 0)
-                    MessageBox.Show("没找到名称包含「" + keyword + "」的项目。", "搜索",
-                        MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-            finally { Cursor.Current = Cursors.Default; }
+            if (keyword.Length == 0 || (!chkSub.Checked && subtreeResultMode)) { LoadDir(); return; }
+            if (!chkSub.Checked) { Render(); return; }
+            var path = currentPath;
+            string warning = "";
+            StartLoad(token => Transfer.SearchRemote(serial, path, keyword, token, out warning), true, keyword, () => warning);
         }
 
         private void OpenSelected()
         {
-            if (list.SelectedItems.Count == 0) return;
-            var tag = list.SelectedItems[0].Tag;
-            if (tag is string && (string)tag == "..") { GoUp(); return; }
-
-            var entry = tag as RemoteEntry;
+            if (list.SelectedIndices.Count == 0) return;
+            var index = list.SelectedIndices[0];
+            if (showParent && index == 0) { GoUp(); return; }
+            var entry = EntryAt(index);
             if (entry == null) return;
+
+            if (!entry.IsDir && MediaPreview.CanPreview(entry.FullPath)) { PreviewSelected(); return; }
 
             if (subtreeResultMode)
             {
@@ -445,14 +538,22 @@ namespace PhoneAudioTray
             if (e.KeyCode == Keys.Delete) { e.Handled = true; DeleteSelected(false); }
             else if (e.KeyCode == Keys.F5) { e.Handled = true; LoadDir(); }
             else if (e.KeyCode == Keys.Back) { e.Handled = true; GoUp(); }
+            else if (e.KeyCode == Keys.Space) { e.SuppressKeyPress = true; PreviewSelected(); }
+        }
+
+        private void PreviewSelected()
+        {
+            var selected = SelectedEntries();
+            if (selected.Count != 1 || selected[0].IsDir || selected[0].IsLink || selected[0].IsUnavailable || !MediaPreview.CanPreview(selected[0].FullPath)) return;
+            using (var dialog = new MediaPreviewDialog(serial, selected[0])) dialog.ShowDialog(this);
         }
 
         private List<RemoteEntry> SelectedEntries()
         {
             var items = new List<RemoteEntry>();
-            foreach (ListViewItem item in list.SelectedItems)
+            foreach (int index in list.SelectedIndices)
             {
-                var entry = item.Tag as RemoteEntry;
+                var entry = EntryAt(index);
                 if (entry != null) items.Add(entry);
             }
             return items;
@@ -476,28 +577,19 @@ namespace PhoneAudioTray
                     MessageBoxButtons.OKCancel, permanent ? MessageBoxIcon.Warning : MessageBoxIcon.Question) != DialogResult.OK)
                 return;
 
-            Cursor.Current = Cursors.WaitCursor;
-            int ok = 0, fail = 0;
-            var errs = new StringBuilder();
-            try
-            {
-                foreach (var entry in items)
+            using (var operation = new FileOperationDialog(permanent ? "彻底删除" : "移到回收站", items.Select(entry => entry.Name).ToArray(),
+                (index, token) =>
                 {
-                    string msg;
-                    var done = permanent
-                        ? Transfer.DeletePermanent(serial, entry, out msg)
-                        : Transfer.MoveToTrash(serial, entry, out msg);
-
-                    if (done) ok++;
-                    else { fail++; errs.AppendLine(entry.Name + "：" + msg); }
-                }
+                    string message;
+                    bool done = permanent ? Transfer.DeletePermanent(serial, items[index], out message, token)
+                        : Transfer.MoveToTrash(serial, items[index], out message, token);
+                    if (!done) throw new IOException(message);
+                }))
+            {
+                operation.ShowDialog(this);
+                LoadDir();
+                operation.ShowResult("");
             }
-            finally { Cursor.Current = Cursors.Default; }
-
-            LoadDir();
-            if (fail > 0)
-                MessageBox.Show("成功 " + ok + "，失败 " + fail + "\r\n\r\n" + errs, "删除结果",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         private void PullSelected()
@@ -511,32 +603,12 @@ namespace PhoneAudioTray
 
             var targetDir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "手机文件");
-            Directory.CreateDirectory(targetDir);
-
-            var sb = new StringBuilder();
-            int ok = 0, fail = 0;
-            Cursor.Current = Cursors.WaitCursor;
-            try
+            using (var operation = new FileOperationDialog("取文件", targets.Select(entry => entry.Name).ToArray(),
+                (index, token) => Transfer.PullEntry(serial, targets[index], targetDir, token)))
             {
-                foreach (var f in targets)
-                {
-                    var output = Program.RunAdb(
-                        "-s " + serial + " pull " + Transfer.Q(f.FullPath) + " " + Transfer.Q(targetDir), 600000);
-                    if (output.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        fail++;
-                        sb.AppendLine("[失败] " + f.Name + "  " + output.Trim());
-                    }
-                    else { ok++; sb.AppendLine("[成功] " + f.Name + (f.IsDir ? "（整个文件夹）" : "")); }
-                }
+                operation.ShowDialog(this);
+                operation.ShowResult("保存到：" + targetDir);
             }
-            finally { Cursor.Current = Cursors.Default; }
-
-            if (fail > 0)
-                MessageBox.Show("保存到：" + targetDir + "\r\n\r\n成功 " + ok + "，失败 " + fail + "\r\n\r\n" + sb,
-                    "取文件", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            else
-                Toast.Show("文件已取回", ok + " 个 → 下载\\手机文件");
         }
     }
 
@@ -546,6 +618,9 @@ namespace PhoneAudioTray
         private readonly string serial;
         private ListView list;
         private List<Transfer.TrashItem> items = new List<Transfer.TrashItem>();
+        private CancellationTokenSource load;
+        private bool closed;
+        private Label status;
 
         public TrashDialog(string serial)
         {
@@ -556,9 +631,11 @@ namespace PhoneAudioTray
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
 
+            status = new Label { Left = 12, Top = 12, Width = 840, Height = 20 };
+            Controls.Add(status);
             list = new ListView
             {
-                Left = 12, Top = 12, Width = 840, Height = 370,
+                Left = 12, Top = 36, Width = 840, Height = 346,
                 View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = true
             };
             list.Columns.Add("名称", 220);
@@ -586,65 +663,77 @@ namespace PhoneAudioTray
             Shown += (s, e) => LoadAll();
         }
 
-        private void LoadAll()
+        protected override void Dispose(bool disposing)
         {
-            Cursor.Current = Cursors.WaitCursor;
+            closed = true;
+            if (disposing && load != null) load.Cancel();
+            base.Dispose(disposing);
+        }
+
+        private async void LoadAll()
+        {
+            if (closed) return;
+            if (load != null) load.Cancel();
+            var request = new CancellationTokenSource();
+            load = request;
+            list.Enabled = false;
+            status.Text = "正在加载回收站…";
             try
             {
-                items = Transfer.ListTrash(serial);
+                var result = await Task.Run(() => Transfer.ListTrash(serial, request.Token), request.Token);
+                if (closed || request.IsCancellationRequested || load != request) return;
+                items = result;
                 list.BeginUpdate();
-                list.Items.Clear();
-                foreach (var t in items)
+                try
                 {
-                    var sizeText = t.IsDir
-                        ? "文件夹"
-                        : (t.Size >= 1024 * 1024
-                            ? (t.Size / 1024.0 / 1024).ToString("0.0") + " MB"
-                            : (t.Size / 1024.0).ToString("0") + " KB");
-                    list.Items.Add(new ListViewItem(new[] { t.Name, t.Source, sizeText, t.DeletedAt }) { Tag = t });
+                    list.Items.Clear();
+                    foreach (var item in items)
+                    {
+                        var size = new RemoteEntry { Size = item.Size, IsDir = item.IsDir }.SizeText;
+                        list.Items.Add(new ListViewItem(new[] { item.Name, item.Source, item.IsDir ? "文件夹" : size, item.DeletedAt }) { Tag = item });
+                    }
                 }
-                list.EndUpdate();
+                finally { list.EndUpdate(); }
+                status.Text = items.Count + " 个项目";
             }
-            finally { Cursor.Current = Cursors.Default; }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                if (!closed && load == request) status.Text = "加载失败：" + ex.Message;
+            }
+            finally
+            {
+                if (load == request)
+                {
+                    load = null;
+                    if (!closed) list.Enabled = true;
+                }
+                request.Dispose();
+            }
         }
 
-        private void DoRestore()
-        {
-            if (list.SelectedItems.Count == 0) return;
-            int ok = 0, fail = 0;
-            var errs = new StringBuilder();
-            foreach (ListViewItem item in list.SelectedItems)
-            {
-                var t = (Transfer.TrashItem)item.Tag;
-                string msg;
-                if (Transfer.RestoreTrash(serial, t, out msg)) ok++;
-                else { fail++; errs.AppendLine(t.Name + "：" + msg); }
-            }
-            LoadAll();
-            if (fail > 0)
-                MessageBox.Show("还原成功 " + ok + "，失败 " + fail + "\r\n\r\n" + errs, "还原",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        }
+        private void DoRestore() { RunSelected(false); }
+        private void DoPurge() { RunSelected(true); }
 
-        private void DoPurge()
+        private void RunSelected(bool purge)
         {
-            if (list.SelectedItems.Count == 0) return;
-            if (MessageBox.Show("把选中的项目从回收站彻底删除？不可恢复。", "彻底删除",
-                    MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
-
-            int ok = 0, fail = 0;
-            var errs = new StringBuilder();
-            foreach (ListViewItem item in list.SelectedItems)
+            if (closed || load != null || list.SelectedItems.Count == 0) return;
+            if (purge && MessageBox.Show("把选中的项目从回收站彻底删除？不可恢复。", "彻底删除",
+                MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
+            var selected = list.SelectedItems.Cast<ListViewItem>().Select(item => (Transfer.TrashItem)item.Tag).ToList();
+            using (var operation = new FileOperationDialog(purge ? "清理回收站" : "还原文件", selected.Select(item => item.Name).ToArray(),
+                (index, token) =>
+                {
+                    string message;
+                    bool done = purge ? Transfer.PurgeTrash(serial, selected[index], out message, token)
+                        : Transfer.RestoreTrash(serial, selected[index], out message, token);
+                    if (!done) throw new IOException(message);
+                }))
             {
-                var t = (Transfer.TrashItem)item.Tag;
-                string msg;
-                if (Transfer.PurgeTrash(serial, t, out msg)) ok++;
-                else { fail++; errs.AppendLine(t.Name + "：" + msg); }
+                operation.ShowDialog(this);
+                LoadAll();
+                operation.ShowResult("");
             }
-            LoadAll();
-            if (fail > 0)
-                MessageBox.Show("删除成功 " + ok + "，失败 " + fail + "\r\n\r\n" + errs, "彻底删除",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 }

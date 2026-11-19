@@ -7,6 +7,30 @@ namespace PhoneAudioTray
 {
     internal static class Shortcut
     {
+        private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string StartupName = "PhoneAudioTray";
+
+        public static bool StartupEnabled
+        {
+            get
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey))
+                    return key != null && !string.IsNullOrEmpty(key.GetValue(StartupName) as string);
+            }
+        }
+
+        public static void SetStartup(bool enabled)
+        {
+            // 使用便携版入口路径，而不是释放 ADB/scrcpy 的 BaseDir。
+            using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKey))
+            {
+                if (enabled)
+                    key.SetValue(StartupName, "\"" + System.Windows.Forms.Application.ExecutablePath + "\"", Microsoft.Win32.RegistryValueKind.String);
+                else
+                    key.DeleteValue(StartupName, false);
+            }
+        }
+
         // ---- COM 定义 ----
         [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
         private class CShellLink { }

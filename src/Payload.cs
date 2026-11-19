@@ -14,6 +14,8 @@ namespace PhoneAudioTray
         private static readonly string[] Required =
         {
             "scrcpy.exe", "scrcpy-server", "scrcpy.ico", "app.ico", "adb.exe", "SDL3.dll",
+            "AdbWinApi.dll", "AdbWinUsbApi.dll", "avcodec-62.dll", "avformat-62.dll",
+            "avutil-60.dll", "swresample-6.dll", "libusb-1.0.dll",
             "使用手册.md"
         };
 
@@ -21,7 +23,7 @@ namespace PhoneAudioTray
         public static string Ensure()
         {
             var localDir = AppDomain.CurrentDomain.BaseDirectory;
-            if (Required.All(f => File.Exists(Path.Combine(localDir, f))))
+            if (Required.All(f => IsComplete(Path.Combine(localDir, f))))
                 return localDir;
 
             var asm = Assembly.GetExecutingAssembly();
@@ -33,7 +35,8 @@ namespace PhoneAudioTray
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "PhoneAudioTray", PayloadVersion);
 
-            if (Required.All(f => File.Exists(Path.Combine(root, f))))
+            if (Required.All(f => IsComplete(Path.Combine(root, f)))
+                && names.Where(LooksLikePayload).All(name => ResourceMatches(asm, name, root)))
                 return root;
 
             try
@@ -48,12 +51,12 @@ namespace PhoneAudioTray
                         ? "使用手册.md"
                         : name;
                     var dest = Path.Combine(root, destName);
-                    if (File.Exists(dest) && new FileInfo(dest).Length > 0) continue;
+                    if (ResourceMatches(asm, name, root)) continue;
 
                     using (var src = asm.GetManifestResourceStream(name))
                     {
                         if (src == null) continue;
-                        using (var fs = File.Create(dest)) src.CopyTo(fs);
+                        ExtractResource(src, dest);
                     }
                 }
                 return root;
@@ -65,6 +68,39 @@ namespace PhoneAudioTray
                     "传声", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return localDir;
             }
+        }
+
+        private static bool IsComplete(string path)
+        {
+            return File.Exists(path) && new FileInfo(path).Length > 0;
+        }
+
+        private static bool ResourceMatches(Assembly assembly, string name, string root)
+        {
+            var path = Path.Combine(root, name == "manual.md" ? "使用手册.md" : name);
+            using (var source = assembly.GetManifestResourceStream(name))
+                return source != null && File.Exists(path) && new FileInfo(path).Length == source.Length;
+        }
+
+        internal static void ExtractResource(Stream source, string destination)
+        {
+            // A failed/interrupted extraction must not publish a nonempty partial DLL.
+            var temporary = destination + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                using (var output = File.Create(temporary)) source.CopyTo(output);
+                if (File.Exists(destination)) File.Replace(temporary, destination, null);
+                else
+                {
+                    try { File.Move(temporary, destination); }
+                    catch (IOException)
+                    {
+                        // Another first-launch process may have published the same resource.
+                        if (!File.Exists(destination) || new FileInfo(destination).Length != new FileInfo(temporary).Length) throw;
+                    }
+                }
+            }
+            finally { if (File.Exists(temporary)) File.Delete(temporary); }
         }
 
         private static bool LooksLikePayload(string name)

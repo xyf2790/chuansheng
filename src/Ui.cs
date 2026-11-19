@@ -168,6 +168,8 @@ namespace PhoneAudioTray
     // ---------- 音量对话框（手机 + 电脑侧）----------
     internal sealed class VolumeDialog : Form
     {
+        private readonly float originalPcVolume;
+        private bool phoneChanged;
         private TrackBar phoneBar;
         private TrackBar pcBar;
         private Label phoneValue;
@@ -186,8 +188,9 @@ namespace PhoneAudioTray
             MinimizeBox = false;
             Font = new Font("Microsoft YaHei UI", 9f);
 
+            originalPcVolume = pcVolume;
             PcValue = pcVolume;
-            PhoneValue = phonePct;
+            PhoneValue = -1;
 
             var lbl1 = new Label
             {
@@ -213,7 +216,7 @@ namespace PhoneAudioTray
                 ForeColor = Color.DimGray,
                 Text = phoneAvailable
                     ? "改这里会直接改手机的媒体音量（adb 下发）。"
-                    : "还没连接手机，手机音量不可调。"
+                    : "连接手机且可读取媒体音量后，手机音量才可调节。"
             };
             Controls.Add(hint);
 
@@ -243,6 +246,7 @@ namespace PhoneAudioTray
 
             phoneBar.ValueChanged += (s, e) =>
             {
+                phoneChanged = true;
                 phoneValue.Text = phoneBar.Value + "%";
             };
             pcBar.ValueChanged += (s, e) =>
@@ -258,8 +262,9 @@ namespace PhoneAudioTray
             if (DialogResult == DialogResult.OK)
             {
                 PcValue = pcBar.Value / 100f;
-                PhoneValue = phoneBar.Enabled ? phoneBar.Value : -1;
+                PhoneValue = phoneBar.Enabled && phoneChanged ? phoneBar.Value : -1;
             }
+            else if (Program.PcVolume != originalPcVolume) Program.SetPcVolume(originalPcVolume);
         }
     }
 

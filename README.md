@@ -5,7 +5,7 @@
 ![scrcpy](https://img.shields.io/badge/scrcpy-4.1-3DDC84)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-把手机的声音和画面投到 Windows：**音频转发、屏幕镜像、麦克风监听、剪贴板同步、文件互传、进程树管理**。
+把手机的声音和画面投到 Windows：**音频转发、屏幕镜像、麦克风监听、剪贴板同步、文件互传、手机任务管理**。
 基于 [scrcpy](https://github.com/Genymobile/scrcpy) 的托盘小工具，**无账号、无服务器、不联网**，USB 或局域网直连。
 
 > 目标很简单：电脑的耳机和键盘，接着用手机。
@@ -21,9 +21,9 @@
 | **手机麦克风** | 两种用法：**监听**（菜单开关，默认关、独立）／**共享**（无菜单项，默认关，开画面时自动跟随） |
 | **手机音量** | 在电脑上直接调手机媒体音量（走 `input keyevent`，绕开部分机型对 `cmd media_session --set` 的拦截） |
 | **剪贴板互通** | 纯文本，双向 |
-| **文件互传** | 推送/取回、目录树浏览、搜索、删除（带回收站可还原） |
-| **进程树** | 按内存排序、按父进程展开、应用图标 + 中文名、强停应用 |
-| **托盘常驻** | 无主窗口，右键菜单操作；退出时用 Job 对象兜底杀掉子进程 |
+| **文件互传** | 保留完整文件名的推送/取回、图片/视频预览、目录树浏览、搜索、删除（带回收站可还原） |
+| **手机任务管理器** | 应用名称、CPU、内存平铺显示，按占用排序、自动刷新、强停应用 |
+| **托盘常驻** | 无主窗口，左键或右键菜单操作，支持 Windows 登录自启动；退出时用 Job 对象兜底杀掉子进程 |
 | **命令行** | 所有功能都能用 `pat --xxx` 调用，可接脚本 |
 
 ## 系统要求
@@ -47,9 +47,9 @@
 
 ## 下载与使用
 
-1. 到 [Releases](https://github.com/xyf2790/chuansheng/releases) 下载 `Transmit-v1.0.0.exe`（便携版单文件，约 25 MB，内含 scrcpy 与 adb）
+1. 到 [Releases](https://github.com/Yuki3303-a11y/chuansheng/releases) 下载 `Transmit-v1.1.5.exe`（便携版单文件，约 25 MB，内含 scrcpy 与 adb）
 2. 双击运行（文件名可随意改）→ **首次会解压约 25 MB** 到 `%LOCALAPPDATA%\PhoneAudioTray\`（5~15 秒）
-3. 托盘出现图标，**双击**打开连接窗口 → 选设备 → 连接
+3. 托盘出现图标，左键或右键 →「连接手机」打开连接窗口 → 选设备 → 连接
 4. 右键托盘菜单可开画面、调音量、传文件、看进程
 
 详细说明见 **[使用手册.md](./使用手册.md)**（含常见问题排查、命令行完整命令表）。
@@ -71,6 +71,8 @@ pat --stop-all
 
 ## 从源码构建
 
+也可在 PowerShell 执行 `./build.ps1 -Portable`，默认复用 `%LOCALAPPDATA%\PhoneAudioTray\4.1` 的运行时；用 `-Runtime` 指定其他目录。输出 `Transmit-v<版本>.exe`。
+
 需要 Windows 自带的 C# 编译器（.NET Framework 4.8 自带 `csc.exe`，无需装 Visual Studio）：
 
 ```cmd
@@ -78,15 +80,25 @@ build.cmd            :: 编译开发版 传声.exe（运行时去 D:\Apply\Scrcp
 build.cmd portable   :: 打包单文件版（需要把 scrcpy 运行时放在同目录或设置 SCRCPY_DIR）
 ```
 
+也可使用 PowerShell 构建，运行时路径支持空格：
+
+```powershell
+./build.ps1
+./build.ps1 -Portable -Runtime '<scrcpy 4.1 运行时目录>'
+```
+
+回归检查说明见 [tests/README.md](tests/README.md)。
+
 ## 目录结构
 
 ```
-src/                  C# 源码（13 个文件，单文件编译，无 NuGet 依赖）
+src/                  C# 源码（单文件编译，无 NuGet 依赖）
   Program.cs          托盘、会话管理、命令分发
   Ui.cs               连接窗口 / 音量 / 调试窗口
   FileBrowser.cs      文件浏览、回收站
   Transfer.cs         推送、拉取、搜索
-  ProcessTree.cs      进程树
+  MediaPreview.cs     图片/视频预览、临时缓存
+  ProcessTree.cs      手机任务管理器
   AppIcons.cs         APK 图标提取 + 包名中文名映射（236 条）
   Toast.cs            Windows 通知（WinRT，经 PowerShell 5.1 桥接）
   Shortcut.cs         创建带 AppUserModelID 的开始菜单快捷方式

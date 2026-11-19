@@ -5,5 +5,5 @@ using System.Reflection;
 [assembly: AssemblyProduct("传声 · Transmit")]
 [assembly: AssemblyCompany("xyf2790")]
 [assembly: AssemblyCopyright("MIT License")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.1.5.0")]
+[assembly: AssemblyFileVersion("1.1.5.0")]

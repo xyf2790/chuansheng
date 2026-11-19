@@ -1,4 +1,4 @@
-// AppIcons.cs — 应用图标（从 APK 抽真实图标，取不到就画首字母头像）+ 常见包名中文名
+﻿// AppIcons.cs — 应用图标（从 APK 抽真实图标，取不到就画首字母头像）+ 常见包名中文名
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -292,26 +292,24 @@ namespace PhoneAudioTray
 
         public static Image Get(string pkg)
         {
+            if (string.IsNullOrEmpty(pkg)) return null;
             lock (Gate)
             {
                 Image img;
                 if (Cache.TryGetValue(pkg, out img)) return img;
-            }
-
-            var file = CacheFile(pkg);
-            if (File.Exists(file))
-            {
                 try
                 {
-                    var img = Image.FromFile(file);
-                    lock (Gate) Cache[pkg] = img;
+                    var file = CacheFile(pkg);
+                    if (!File.Exists(file)) return null;
+                    // Detach from the file before caching; serialize first load so competing
+                    // requests cannot overwrite an undisposed Image or keep the PNG locked.
+                    using (var source = Image.FromFile(file)) img = new Bitmap(source);
+                    Cache[pkg] = img;
                     return img;
                 }
-                catch { }
+                catch { return null; }
             }
-            return null;
         }
-
         public static Image GetOrAvatar(string pkg)
         {
             var img = Get(pkg);
@@ -358,7 +356,7 @@ namespace PhoneAudioTray
 
                 int hash = 0;
                 foreach (var c in pkg ?? "") hash = hash * 31 + c;
-                var hue = Math.Abs(hash) % 360;
+                var hue = Math.Abs((long)hash) % 360;
                 var back = ColorFromHsv(hue, 0.55, 0.85);
 
                 using (var b = new SolidBrush(back))
